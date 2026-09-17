@@ -5,10 +5,12 @@
  */
 declare module "bun:test" {
   export interface Expect {
+    not: Expect
     toBe: (expected: unknown) => void
     toEqual: (expected: unknown) => void
     toMatchObject: (expected: Record<string, unknown>) => void
     toHaveLength: (length: number) => void
+    toBeGreaterThan: (expected: number) => void
   }
 
   export function expect(received: unknown): Expect

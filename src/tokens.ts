@@ -4,9 +4,13 @@ export type Tokens = {
   out: number
 }
 
+import { formatSpeed, rowKey, PEAK_WIDTH } from "./speed"
+
 export type Row = Tokens & {
   agent: string
   model: string
+  key: string
+  peak?: number
 }
 
 export type AssistantMessageLike = {
@@ -47,10 +51,11 @@ export function groupRows(messages: AssistantMessageLike[]): Row[] {
   const grouped = new Map<string, Row>()
   for (const message of messages) {
     if (message.role !== "assistant") continue
-    const key = `${message.agent}\u0000${message.providerID}\u0000${message.modelID}`
+    const key = rowKey(message.agent, message.providerID, message.modelID)
     const row = grouped.get(key) ?? {
       agent: message.agent,
       model: modelName(message.modelID),
+      key,
       hit: 0,
       miss: 0,
       out: 0,
@@ -114,6 +119,7 @@ export function header(): string {
     fixed("miss", MISS_WIDTH, "right"),
     fixed("out", OUT_WIDTH, "right"),
     fixed("rate", RATE_WIDTH, "right"),
+    fixed("peak t/s", PEAK_WIDTH, "right"),
   ].join(" | ")
 }
 
@@ -126,5 +132,6 @@ export function renderRow(row: Partial<Row>): string {
     fixed(formatTokens(data.miss), MISS_WIDTH, "right"),
     fixed(formatTokens(data.out), OUT_WIDTH, "right"),
     fixed(rate(data), RATE_WIDTH, "right"),
+    fixed(row.peak === undefined ? "" : formatSpeed(row.peak), PEAK_WIDTH, "right"),
   ].join(" | ")
 }
