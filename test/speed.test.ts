@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { appendDelta, formatSpeed, rowKey, speed, CHARS_PER_TOKEN, SPEED_WINDOW_MS, type DeltaEntry } from "../src/speed"
+import { appendDelta, formatSpeed, rowKey, speed, SpeedTracker, CHARS_PER_TOKEN, SPEED_WINDOW_MS, type DeltaEntry } from "../src/speed"
 import { createPeakPersistence, PEAK_KEY, PEAK_ROOTS_MAX, type KVStore } from "../src/persistence"
 
 function memoryKV(): KVStore {
@@ -44,12 +44,76 @@ describe("streaming speed", () => {
   })
 })
 
+describe("speed regressions", () => {
+  test("does not inflate speed when the oldest window sample expires", () => {
+    const entries = [{ t: 0, chars: 400 }, { t: 2_000, chars: 400 }]
+    expect(speed(entries, 2_999)).toBe(200 / 2.999)
+    expect(speed(entries, 3_001)).toBe(100 / 3)
+  })
+
+  test("uses a half-open window for a steady stream", () => {
+    const entries = Array.from({ length: 5 }, (_, index) => ({ t: index * 1_000, chars: 40 }))
+    expect(speed(entries, 3_000)).toBe(10)
+    expect(speed(entries, 4_000)).toBe(10)
+    expect(speed(entries, 7_000)).toBe(0)
+  })
+
+  test("does not count deltas from the future", () => {
+    expect(speed([{ t: 1_001, chars: 400 }], 1_000)).toBe(0)
+  })
+})
+
+describe("stream lifecycle", () => {
+  test("captures a short burst before the render timer and retains its peak on idle", () => {
+    const peaks = new Map<string, number>()
+    const tracker = new SpeedTracker((sessionID, key, value) => peaks.set(`${sessionID}:${key}`, value))
+    tracker.bind("s", "m", "row")
+    tracker.append("s", "m", "a".repeat(400), 100)
+    tracker.clear("s")
+    expect(tracker.current("s", 200)).toBe(0)
+    expect(peaks.get("s:row")).toBe(100)
+  })
+
+  test("associates delayed metadata with the exact message rather than history order", () => {
+    const peaks = new Map<string, number>()
+    const tracker = new SpeedTracker((_, key, value) => peaks.set(key, value))
+    tracker.append("s", "new", "a".repeat(400), 100)
+    tracker.bind("s", "old", "old-row")
+    expect(peaks.size).toBe(0)
+    tracker.bind("s", "new", "new-row")
+    expect(peaks.get("new-row")).toBe(100)
+  })
+
+  test("does not combine successive messages or models", () => {
+    const peaks = new Map<string, number>()
+    const tracker = new SpeedTracker((_, key, value) => peaks.set(key, value))
+    tracker.bind("s", "first", "first-row")
+    tracker.bind("s", "second", "second-row")
+    tracker.append("s", "first", "a".repeat(400), 100)
+    tracker.append("s", "second", "a".repeat(40), 200)
+    expect(tracker.current("s", 200)).toBe(10)
+    expect(peaks.get("first-row")).toBe(100)
+    expect(peaks.get("second-row")).toBe(10)
+  })
+
+  test("isolates concurrent sessions and counts Unicode code points", () => {
+    const tracker = new SpeedTracker(() => {})
+    tracker.append("a", "m", "\u{1F600}".repeat(40), 100)
+    tracker.append("b", "m", "b".repeat(80), 100)
+    expect(tracker.current("a", 100)).toBe(10)
+    expect(tracker.current("b", 100)).toBe(20)
+    tracker.clear("a")
+    expect(tracker.current("b", 100)).toBe(20)
+  })
+})
+
 describe("appendDelta", () => {
-  test("trims entries older than two windows", () => {
-    const entries: DeltaEntry[] = [{ t: 0, chars: 1 }]
-    appendDelta(entries, { t: SPEED_WINDOW_MS * 2 + 1, chars: 1 })
-    expect(entries).toHaveLength(1)
-    expect(entries[0].t).toBe(SPEED_WINDOW_MS * 2 + 1)
+  test("retains one anchor when trimming older entries", () => {
+    const entries: DeltaEntry[] = [{ t: 0, chars: 1 }, { t: 1, chars: 1 }]
+    appendDelta(entries, { t: SPEED_WINDOW_MS * 2 + 2, chars: 1 })
+    expect(entries).toHaveLength(2)
+    expect(entries[0].t).toBe(1)
+    expect(speed(entries, SPEED_WINDOW_MS * 2 + 2)).toBe(1 / 12)
   })
 })
 

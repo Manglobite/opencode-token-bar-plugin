@@ -83,9 +83,15 @@ model label is the segment after the final `/` in `modelID`.
 speed is derived from `message.part.delta` events where `field === "text"`
 (both text and reasoning deltas use this field). Character counts are kept in a
 per-session sliding window of 3 seconds and converted with `CHARS_PER_TOKEN`
-(4). A single-delta span is floored at one second to avoid first-chunk spikes.
+(4), counting Unicode code points. The elapsed span since the first delta is
+clamped to 1–3 seconds; after warm-up the denominator stays at 3 seconds even
+when old samples expire. Timing uses a monotonic clock. Each new message starts
+a separate window, so successive models and responses are not mixed.
 The summary row reports the open session's current speed; expanded rows report
-the peak value per row.
+the maximum estimated speed observed on delta arrival, not an average or a final
+rate computed from billed output tokens. Peaks are attributed by message ID,
+independent of history ordering, and short bursts are captured between UI ticks.
+Previously persisted peaks are retained and may reflect the old calculation.
 
 ## Persistence and lifecycle
 
@@ -98,8 +104,9 @@ the peak value per row.
   least-recently-written first, so the value does not grow without bound.
 - Live delta buffers are kept only for sessions of an open panel tree
   (`message.part.delta`, `field === "text"`). A session's buffer and row mapping
-  are dropped on `session.idle` and `session.deleted`, so unrelated or finished
-  sessions retain no state.
+  are dropped on idle/retry status, `session.idle`, `session.deleted`, and when
+  the last panel stops tracking the session. Dirty peaks are saved on the timer
+  even if no further delta arrives.
 - A running interval starts while any included session is `busy` or `retry` and
   closes when all are idle. Open intervals are also closed during `onDispose`.
 - On restore, a stale `started` marker is deliberately discarded so time while
