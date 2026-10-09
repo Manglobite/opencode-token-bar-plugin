@@ -9,7 +9,7 @@ import {
   createPeakPersistence,
 } from "./persistence"
 import { groupRows, header, renderRow, summary, formatDuration, type Row } from "./tokens"
-import { appendDelta, formatSpeed, rowKey, speed, PEAK_SAVE_INTERVAL_MS, type DeltaEntry } from "./speed"
+import { formatSpeed, rowKey, SpeedTracker, PEAK_SAVE_INTERVAL_MS } from "./speed"
 import { descendants, rootSession } from "./session-tree"
 
 type SessionClient = {
@@ -62,8 +62,8 @@ const tui: TuiPlugin = async (api) => {
   const activeTimePersistence = createActiveTimePersistence(api.kv)
   const expandedPersistence = createExpandedPersistence(api.kv)
   const peakPersistence = createPeakPersistence(api.kv)
-  const sessionBuffers = new Map<string, DeltaEntry[]>()
-  const sessionRow = new Map<string, string>()
+  const sessionRoots = new Map<string, string>()
+  const dirtyPeaks = new Set<string>()
   const peaksByRoot = new Map<string, Map<string, number>>()
   const tracked = new Map<string, number>()
   let lastPeakSaveAt = 0
@@ -78,7 +78,11 @@ const tui: TuiPlugin = async (api) => {
     for (const sessionID of sessionIDs) {
       const count = (tracked.get(sessionID) ?? 0) - 1
       if (count > 0) tracked.set(sessionID, count)
-      else tracked.delete(sessionID)
+      else {
+        tracked.delete(sessionID)
+        streams.clear(sessionID)
+        sessionRoots.delete(sessionID)
+      }
     }
   }
 
@@ -89,38 +93,46 @@ const tui: TuiPlugin = async (api) => {
     peaksByRoot.set(rootID, loaded)
     return loaded
   }
-  const savePeaks = (rootID: string, force = false) => {
+  const savePeaks = () => {
     const now = Date.now()
-    if (!force && now - lastPeakSaveAt < PEAK_SAVE_INTERVAL_MS) return
+    if (dirtyPeaks.size === 0 || now - lastPeakSaveAt < PEAK_SAVE_INTERVAL_MS) return
     lastPeakSaveAt = now
-    peakPersistence.save(rootID, peaksFor(rootID))
+    for (const rootID of dirtyPeaks) peakPersistence.save(rootID, peaksFor(rootID))
+    dirtyPeaks.clear()
   }
+  const streams = new SpeedTracker((sessionID, key, value) => {
+    const rootID = sessionRoots.get(sessionID)
+    if (!rootID) return
+    const peaks = peaksFor(rootID)
+    if (value <= (peaks.get(key) ?? 0)) return
+    peaks.set(key, value)
+    dirtyPeaks.add(rootID)
+    savePeaks()
+  })
 
   const refresh = () => setRevision((current) => current + 1)
   const stopMessage = api.event.on("message.updated", (event) => {
     const info = event.properties.info
     if (isAssistant(info) && tracked.has(info.sessionID)) {
-      sessionRow.set(info.sessionID, rowKey(info.agent, info.providerID, info.modelID))
+      streams.bind(info.sessionID, info.id, rowKey(info.agent, info.providerID, info.modelID))
     }
     refresh()
   })
   const stopPart = api.event.on("message.part.updated", refresh)
   const stopSession = api.event.on("session.created", refresh)
   const stopStatus = api.event.on("session.status", (event) => {
+    if (event.properties.status.type !== "busy") streams.clear(event.properties.sessionID)
     setStatus((current) => ({ ...current, [event.properties.sessionID]: event.properties.status.type }))
     refresh()
   })
   const stopDelta = api.event.on("message.part.delta", (event) => {
     if (event.properties.field !== "text") return
-    const { sessionID, delta } = event.properties
+    const { sessionID, messageID, delta } = event.properties
     if (!delta || !tracked.has(sessionID)) return
-    const entries = sessionBuffers.get(sessionID) ?? []
-    appendDelta(entries, { t: Date.now(), chars: delta.length })
-    sessionBuffers.set(sessionID, entries)
+    streams.append(sessionID, messageID, delta, performance.now())
   })
   const forgetSession = (sessionID: string) => {
-    sessionBuffers.delete(sessionID)
-    sessionRow.delete(sessionID)
+    streams.clear(sessionID)
   }
   const stopIdle = api.event.on("session.idle", (event) => {
     forgetSession(event.properties.sessionID)
@@ -136,8 +148,13 @@ const tui: TuiPlugin = async (api) => {
     })
     activeTimes.delete(sessionID)
     peaksByRoot.delete(sessionID)
+    dirtyPeaks.delete(sessionID)
+    sessionRoots.delete(sessionID)
   })
-  const interval = setInterval(() => setClock(Date.now()), 1_000)
+  const interval = setInterval(() => {
+    savePeaks()
+    setClock(Date.now())
+  }, 1_000)
   api.lifecycle.onDispose(() => {
     const now = Date.now()
     for (const [sessionID, tracker] of activeTimes) {
@@ -178,9 +195,10 @@ const tui: TuiPlugin = async (api) => {
             const rootChanged = root !== rootID()
             setRootID(root)
             setSessionIDs(new Set(ids))
+            track(ids)
             untrack(trackedIds)
             trackedIds = ids
-            track(ids)
+            for (const sessionID of ids) sessionRoots.set(sessionID, root)
             if (!initialized || rootChanged) {
               activeTimes.set(root, new ActiveTimeTracker(activeTimePersistence.load(root)))
             }
@@ -188,7 +206,7 @@ const tui: TuiPlugin = async (api) => {
 
             const assistantMessages = messageSets.flat().filter(isAssistant)
             for (const message of assistantMessages) {
-              sessionRow.set(message.sessionID, rowKey(message.agent, message.providerID, message.modelID))
+              streams.bind(message.sessionID, message.id, rowKey(message.agent, message.providerID, message.modelID))
             }
             setRows(groupRows(assistantMessages))
           } catch {
@@ -223,33 +241,16 @@ const tui: TuiPlugin = async (api) => {
           }
           return formatDuration(tracker.display(now))
         }
-        const applyPeaks = (): Map<string, number> => {
-          const peaks = peaksFor(rootID())
-          let changed = false
-          for (const sessionID of sessionIDs()) {
-            const entries = sessionBuffers.get(sessionID)
-            if (!entries || entries.length === 0) continue
-            const key = sessionRow.get(sessionID)
-            if (!key) continue
-            const current = speed(entries, clock())
-            if (current > (peaks.get(key) ?? 0)) {
-              peaks.set(key, current)
-              changed = true
-            }
-          }
-          if (changed) savePeaks(rootID())
-          return peaks
-        }
         const currentSpeed = (): string => {
-          const entries = sessionBuffers.get(props.session_id) ?? []
-          return `${formatSpeed(speed(entries, clock()))} t/s`
+          clock()
+          return `${formatSpeed(streams.current(props.session_id, performance.now()))} t/s`
         }
         const renderSummary = (): string => {
-          applyPeaks()
           return renderRow({ ...summary(rows()), agent: duration(), model: currentSpeed() })
         }
         const expandedRows = () => {
-          const peaks = applyPeaks()
+          clock()
+          const peaks = peaksFor(rootID())
           return rows().map((row) => (
             <text fg={ctx.theme.current.text}>{renderRow({ ...row, peak: peaks.get(row.key) ?? 0 })}</text>
           ))
